@@ -4,7 +4,6 @@ import traceback
 import adsk.core
 import adsk.fusion
 import math
-import random
 
 app = adsk.core.Application.get()
 ui = app.userInterface
@@ -22,7 +21,6 @@ MIN_HOLE_D_MM = 1.5
 MAX_HOLE_D_MM = 6.0
 TARGET_HOLES = 20
 OUTER_HOOP_WIDTH_MM = 3.5
-INNER_EMBOSS_DEPTH_MM = 1.0
 GAP_MM = 0.2
 HOLE_SCALE = 1.6
 EDGE_RIM_FRACTION = 0.18
@@ -441,17 +439,18 @@ def _cut_polygons_radially(comp: adsk.fusion.Component, polygons, outer_d_mm: fl
     return cuts_made > 0
 
 
-def _cut_centered_pyramids(comp: adsk.fusion.Component, band: adsk.fusion.BRepBody,
-                           outer_mm: float, count: int, band_thickness_mm: float) -> bool:
-    """Cut alternating pyramids with apex at the origin and bases on the XY plane."""
+def _cut_lofted_radial_wedges(comp: adsk.fusion.Component, band: adsk.fusion.BRepBody,
+                              outer_mm: float, count: int, band_thickness_mm: float) -> bool:
+    """Cut alternating radial wedges, lofting only the top face to one side face to steer the triangle."""
+
+    if count <= 0:
+        return False
 
     sketches = comp.sketches
     extrudes = comp.features.extrudeFeatures
     combine_feats = comp.features.combineFeatures
+    loft_feats = comp.features.loftFeatures
     xy_plane = comp.xYConstructionPlane
-
-    if count <= 0:
-        return False
 
     outer_radius = outer_mm / 2.0
     base_radius_mm = max(outer_radius + 2.0, 60.0)
@@ -466,67 +465,142 @@ def _cut_centered_pyramids(comp: adsk.fusion.Component, band: adsk.fusion.BRepBo
         return False
 
     extent = adsk.core.ValueInput.createByReal(_cm(core_half_mm))
-
     sector = 2.0 * math.pi / float(count)
     half_angle = 0.45 * sector
 
-    cuts = 0
-    for i in range(count):
-        # Alternate: cut every other wedge so triangles appear point-up/point-down along the ring
-        if (i % 2) != 0:
-            continue
-
-        center_angle = i * sector
-        a1 = center_angle - half_angle
-        a2 = center_angle + half_angle
-
+    def _make_triangle_profile(sketch: adsk.fusion.Sketch, radius_mm: float,
+                               angle1: float, angle2: float):
+        lines = sketch.sketchCurves.sketchLines
         apex = adsk.core.Point3D.create(0, 0, 0)
-        base1 = adsk.core.Point3D.create(_cm(base_radius_mm * math.cos(a1)),
-                                         _cm(base_radius_mm * math.sin(a1)), 0)
-        base2 = adsk.core.Point3D.create(_cm(base_radius_mm * math.cos(a2)),
-                                         _cm(base_radius_mm * math.sin(a2)), 0)
+        pt1 = adsk.core.Point3D.create(_cm(radius_mm * math.cos(angle1)),
+                                       _cm(radius_mm * math.sin(angle1)), 0)
+        pt2 = adsk.core.Point3D.create(_cm(radius_mm * math.cos(angle2)),
+                                       _cm(radius_mm * math.sin(angle2)), 0)
+        lines.addByTwoPoints(apex, pt1)
+        lines.addByTwoPoints(pt1, pt2)
+        lines.addByTwoPoints(pt2, apex)
+        return sketch.profiles.item(0) if sketch.profiles.count > 0 else None
 
-        sketch = None
+    def _angle_diff(a, b):
+        return abs((a - b + math.pi) % (2 * math.pi) - math.pi)
+
+    def _pick_faces(body: adsk.fusion.BRepBody, target_angle: float):
+        top_face = None
+        top_z = -1e9
+        side_face = None
+        best_diff = None
+        for face in body.faces:
+            geom = getattr(face, 'geometry', None)
+            centroid = getattr(face, 'centroid', None)
+            if centroid:
+                if centroid.z > top_z:
+                    plane = adsk.core.Plane.cast(geom)
+                    if plane is not None and abs(plane.normal.z) > 0.8:
+                        top_face = face
+                        top_z = centroid.z
+            plane = adsk.core.Plane.cast(geom)
+            if plane is None:
+                continue
+            if abs(plane.normal.z) > 0.2:
+                continue
+            if centroid is None:
+                continue
+            ang = math.atan2(centroid.y, centroid.x)
+            diff = _angle_diff(ang, target_angle)
+            if (best_diff is None) or (diff < best_diff):
+                side_face = face
+                best_diff = diff
+        return top_face, side_face
+
+    cuts = 0
+    tool_bodies = []
+
+    try:
+        original_band_visibility = getattr(band, 'isVisible', True)
         try:
-            sketch = sketches.add(xy_plane)
-            sketch.name = f'CenterPyramid_{i}'
-            lines = sketch.sketchCurves.sketchLines
-            lines.addByTwoPoints(apex, base1)
-            lines.addByTwoPoints(base1, base2)
-            lines.addByTwoPoints(base2, apex)
+            band.isVisible = False
+        except Exception:
+            pass
 
-            profiles = adsk.core.ObjectCollection.create()
-            for prof in sketch.profiles:
-                try:
-                    profiles.add(prof)
-                except Exception:
-                    pass
-            if profiles.count == 0:
+        for i in range(count):
+            if (i % 2) != 0:
                 continue
 
-            ext_input = extrudes.createInput(profiles, adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
+            center_angle = i * sector
+            a1 = center_angle - half_angle
+            a2 = center_angle + half_angle
+
+            sketch = None
             try:
-                ext_input.setSymmetricExtent(extent, True)
-            except Exception:
-                ext_input.setDistanceExtent(False, extent)
-            extrude = extrudes.add(ext_input)
+                sketch = sketches.add(xy_plane)
+                sketch.name = f'LoftWedge_{i}'
+                profile = _make_triangle_profile(sketch, base_radius_mm, a1, a2)
+                if profile is None:
+                    continue
 
-            tool_body = extrude.bodies.item(0)
-            tools = adsk.core.ObjectCollection.create()
-            tools.add(tool_body)
-
-            combine_input = combine_feats.createInput(band, tools)
-            combine_input.operation = adsk.fusion.FeatureOperations.CutFeatureOperation
-            combine_input.isKeepToolBodies = False
-            combine_feats.add(combine_input)
-
-            cuts += 1
-        finally:
-            if sketch:
+                ext_input = extrudes.createInput(profile, adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
                 try:
-                    sketch.deleteMe()
+                    ext_input.setSymmetricExtent(extent, True)
+                except Exception:
+                    ext_input.setDistanceExtent(False, extent)
+                extrude = extrudes.add(ext_input)
+                tool_body = extrude.bodies.item(0)
+                try:
+                    tool_body.isVisible = False
                 except Exception:
                     pass
+
+                use_left = (cuts % 2 == 0)
+                target_angle = a1 if use_left else a2
+                top_face, side_face = _pick_faces(tool_body, target_angle)
+                if not top_face or not side_face:
+                    try:
+                        extrude.deleteMe()
+                    except Exception:
+                        pass
+                    continue
+
+                loft_input = loft_feats.createInput(adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
+                loft_input.loftSections.add(top_face)
+                loft_input.loftSections.add(side_face)
+                loft_input.isSolid = True
+                loft_feat = loft_feats.add(loft_input)
+
+                trim_body = loft_feat.bodies.item(0)
+                local_tools = adsk.core.ObjectCollection.create()
+                local_tools.add(trim_body)
+                trim_cut = combine_feats.createInput(tool_body, local_tools)
+                trim_cut.operation = adsk.fusion.FeatureOperations.CutFeatureOperation
+                trim_cut.isKeepToolBodies = False
+                combine_feats.add(trim_cut)
+
+                try:
+                    tool_body.isVisible = True
+                except Exception:
+                    pass
+
+                tool_bodies.append(tool_body)
+                cuts += 1
+            finally:
+                if sketch:
+                    try:
+                        sketch.deleteMe()
+                    except Exception:
+                        pass
+    finally:
+        try:
+            band.isVisible = original_band_visibility
+        except Exception:
+            pass
+
+    if tool_bodies:
+        tools = adsk.core.ObjectCollection.create()
+        for body in tool_bodies:
+            tools.add(body)
+        combine_input = combine_feats.createInput(band, tools)
+        combine_input.operation = adsk.fusion.FeatureOperations.CutFeatureOperation
+        combine_input.isKeepToolBodies = False
+        combine_feats.add(combine_input)
 
     return cuts > 0
 
@@ -536,29 +610,6 @@ def _cut_centered_pyramids(comp: adsk.fusion.Component, band: adsk.fusion.BRepBo
 
 
 
-
-
-def _cut_profiles_through_band(comp: adsk.fusion.Component, sketch: adsk.fusion.Sketch, outer_d_mm: float) -> bool:
-    profiles = adsk.core.ObjectCollection.create()
-    for prof in sketch.profiles:
-        try:
-            profiles.add(prof)
-        except Exception:
-            pass
-    if profiles.count == 0:
-        return False
-
-    extrudes = comp.features.extrudeFeatures
-    cut_distance_cm = 2.0 * _cm(outer_d_mm / 2.0) + 1.0
-    try:
-        ext_input = extrudes.createInput(profiles, adsk.fusion.FeatureOperations.CutFeatureOperation)
-        distance = adsk.core.ValueInput.createByReal(cut_distance_cm)
-        ext_input.setDistanceExtent(False, distance)
-        ext_input.isSolid = True
-        extrudes.add(ext_input)
-        return True
-    except Exception:
-        return False
 
 
 def _make_band(comp: adsk.fusion.Component, outer_d_mm: float, inner_d_mm: float, make_solid: bool = False) -> adsk.fusion.BRepBody:
@@ -580,8 +631,6 @@ def run(_context: str):
         outermost_outer_mm, _ = RING_SPECS_MM[0]
         innermost_inner_mm = RING_SPECS_MM[-1][1]
         pattern_polygons = _generate_hex_polygons(outermost_outer_mm, innermost_inner_mm, OUTER_HOOP_WIDTH_MM, target_count=TARGET_HOLES * 2)
-        # Choose number of radial rotations to replicate the pattern (creates denser lattice)
-        ROTATIONS = 6
 
         for index in range(ring_count):
             outer_mm, inner_mm = RING_SPECS_MM[index]
@@ -608,7 +657,7 @@ def run(_context: str):
             if index <= 2:
                 counts = [24, 18, 12]
                 count = counts[index] if index < len(counts) else 12
-                _cut_centered_pyramids(comp, band, outer_mm, count, band_thickness_mm)
+                _cut_lofted_radial_wedges(comp, band, outer_mm, count, band_thickness_mm)
             else:
                 # Maximum polygons per ring (safeguard for performance)
                 MAX_POLYS_PER_RING = 120
