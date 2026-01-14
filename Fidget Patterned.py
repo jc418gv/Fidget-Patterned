@@ -441,7 +441,7 @@ def _cut_polygons_radially(comp: adsk.fusion.Component, polygons, outer_d_mm: fl
 
 def _cut_lofted_radial_wedges(comp: adsk.fusion.Component, band: adsk.fusion.BRepBody,
                               outer_mm: float, count: int, band_thickness_mm: float) -> bool:
-    """Cut alternating radial wedges, lofting only the top face to one side face to steer the triangle."""
+    """Cut radial wedges, alternating both left/right and top/bottom to interlock the triangles."""
 
     if count <= 0:
         return False
@@ -484,20 +484,25 @@ def _cut_lofted_radial_wedges(comp: adsk.fusion.Component, band: adsk.fusion.BRe
     def _angle_diff(a, b):
         return abs((a - b + math.pi) % (2 * math.pi) - math.pi)
 
-    def _pick_faces(body: adsk.fusion.BRepBody, target_angle: float):
+    def _pick_faces(body: adsk.fusion.BRepBody, target_angle: float, use_top: bool):
         top_face = None
         top_z = -1e9
+        bottom_face = None
+        bottom_z = 1e9
         side_face = None
         best_diff = None
         for face in body.faces:
             geom = getattr(face, 'geometry', None)
             centroid = getattr(face, 'centroid', None)
             if centroid:
-                if centroid.z > top_z:
-                    plane = adsk.core.Plane.cast(geom)
-                    if plane is not None and abs(plane.normal.z) > 0.8:
+                plane = adsk.core.Plane.cast(geom)
+                if plane is not None and abs(plane.normal.z) > 0.8:
+                    if centroid.z > top_z:
                         top_face = face
                         top_z = centroid.z
+                    if centroid.z < bottom_z:
+                        bottom_face = face
+                        bottom_z = centroid.z
             plane = adsk.core.Plane.cast(geom)
             if plane is None:
                 continue
@@ -510,7 +515,12 @@ def _cut_lofted_radial_wedges(comp: adsk.fusion.Component, band: adsk.fusion.BRe
             if (best_diff is None) or (diff < best_diff):
                 side_face = face
                 best_diff = diff
-        return top_face, side_face
+        slab_face = top_face if use_top or bottom_face is None else bottom_face
+        if not use_top and slab_face is None:
+            slab_face = bottom_face
+        if slab_face is None:
+            slab_face = top_face
+        return slab_face, side_face
 
     cuts = 0
     tool_bodies = []
@@ -523,8 +533,6 @@ def _cut_lofted_radial_wedges(comp: adsk.fusion.Component, band: adsk.fusion.BRe
             pass
 
         for i in range(count):
-            if (i % 2) != 0:
-                continue
 
             center_angle = i * sector
             a1 = center_angle - half_angle
@@ -550,10 +558,11 @@ def _cut_lofted_radial_wedges(comp: adsk.fusion.Component, band: adsk.fusion.BRe
                 except Exception:
                     pass
 
-                use_left = (cuts % 2 == 0)
+                use_left = (i % 2 == 0)
+                use_top = ((i // 2) % 2 == 0)
                 target_angle = a1 if use_left else a2
-                top_face, side_face = _pick_faces(tool_body, target_angle)
-                if not top_face or not side_face:
+                base_face, side_face = _pick_faces(tool_body, target_angle, use_top)
+                if not base_face or not side_face:
                     try:
                         extrude.deleteMe()
                     except Exception:
@@ -561,7 +570,7 @@ def _cut_lofted_radial_wedges(comp: adsk.fusion.Component, band: adsk.fusion.BRe
                     continue
 
                 loft_input = loft_feats.createInput(adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
-                loft_input.loftSections.add(top_face)
+                loft_input.loftSections.add(base_face)
                 loft_input.loftSections.add(side_face)
                 loft_input.isSolid = True
                 loft_feat = loft_feats.add(loft_input)
