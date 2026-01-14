@@ -561,9 +561,9 @@ def _cut_profiles_through_band(comp: adsk.fusion.Component, sketch: adsk.fusion.
         return False
 
 
-def _make_band(comp: adsk.fusion.Component, outer_d_mm: float, inner_d_mm: float) -> adsk.fusion.BRepBody:
-    shell = _make_shell(comp, outer_d_mm, inner_d_mm)
-    return _slice_band(comp, shell, SLICE_HALF_THICK_MM)
+def _make_band(comp: adsk.fusion.Component, outer_d_mm: float, inner_d_mm: float, make_solid: bool = False) -> adsk.fusion.BRepBody:
+    base_body = _make_revolved_sphere(comp, _cm(outer_d_mm / 2.0)) if make_solid else _make_shell(comp, outer_d_mm, inner_d_mm)
+    return _slice_band(comp, base_body, SLICE_HALF_THICK_MM)
 
 
 def run(_context: str):
@@ -587,7 +587,8 @@ def run(_context: str):
             outer_mm, inner_mm = RING_SPECS_MM[index]
 
             comp = _create_component(root, f'Ring {index + 1}')
-            band = _make_band(comp, outer_mm, inner_mm)
+            make_solid = (index == (ring_count - 1))
+            band = _make_band(comp, outer_mm, inner_mm, make_solid=make_solid)
             face = _outer_face(band)
             if not face:
                 continue
