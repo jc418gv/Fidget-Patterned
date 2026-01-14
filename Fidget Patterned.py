@@ -614,12 +614,175 @@ def _cut_lofted_radial_wedges(comp: adsk.fusion.Component, band: adsk.fusion.BRe
     return cuts > 0
 
 
-    
+def _planar_face(body: adsk.fusion.BRepBody, prefer_positive_z: bool):
+    best = None
+    best_metric = -1e9 if prefer_positive_z else 1e9
+    for face in body.faces:
+        plane = adsk.core.Plane.cast(face.geometry)
+        if plane is None:
+            continue
+        normal = plane.normal
+        if abs(normal.z) < 0.8:
+            continue
+        centroid = getattr(face, 'centroid', None)
+        if centroid is None:
+            continue
+        if prefer_positive_z and normal.z > 0 and centroid.z > best_metric:
+            best = face
+            best_metric = centroid.z
+        elif (not prefer_positive_z) and normal.z < 0 and centroid.z < best_metric:
+            best = face
+            best_metric = centroid.z
+    return best
 
 
+def _engrave_smiley(comp: adsk.fusion.Component, face: adsk.fusion.BRepFace,
+                    outer_mm: float, depth_mm: float = 1.0) -> bool:
+    plane = adsk.core.Plane.cast(face.geometry)
+    if plane is None:
+        return False
 
+    sketches = comp.sketches
+    try:
+        sketch = sketches.add(face)
+        sketch.name = 'SmileyFace'
+    except Exception:
+        return False
 
+    bb = face.boundingBox
+    span_x_mm = 10.0 * abs(bb.maxPoint.x - bb.minPoint.x)
+    span_y_mm = 10.0 * abs(bb.maxPoint.y - bb.minPoint.y)
+    face_radius_mm = 0.25 * (span_x_mm + span_y_mm)
+    usable_r_mm = max(1.0, 0.9 * face_radius_mm)
+    border_mm = max(0.4, usable_r_mm * 0.12)
+    inner_ring_r_mm = max(usable_r_mm - border_mm, usable_r_mm * 0.6)
 
+    try:
+        sketch.isComputeDeferred = True
+
+        center_world = getattr(face, 'centroid', None)
+        if center_world is None:
+            center_world = adsk.core.Point3D.create(0, 0, 0)
+        center_2d = sketch.modelToSketchSpace(center_world)
+
+        def pt(dx_mm: float, dy_mm: float) -> adsk.core.Point3D:
+            return adsk.core.Point3D.create(center_2d.x + _cm(dx_mm),
+                                            center_2d.y + _cm(dy_mm), 0)
+
+        circles = sketch.sketchCurves.sketchCircles
+        circles.addByCenterRadius(center_2d, _cm(usable_r_mm))
+        circles.addByCenterRadius(center_2d, _cm(inner_ring_r_mm))
+
+        eye_offset_x_mm = usable_r_mm * 0.4
+        eye_offset_y_mm = usable_r_mm * 0.15
+        eye_r_mm = max(0.3, usable_r_mm * 0.08)
+        circles.addByCenterRadius(pt(-eye_offset_x_mm, eye_offset_y_mm), _cm(eye_r_mm))
+        circles.addByCenterRadius(pt(eye_offset_x_mm, eye_offset_y_mm), _cm(eye_r_mm))
+
+        arcs = sketch.sketchCurves.sketchArcs
+        lines = sketch.sketchCurves.sketchLines
+        mouth_half_w_mm = usable_r_mm * 0.55
+        mouth_drop_mm = usable_r_mm * 0.35
+        mouth_mid = pt(0.0, -mouth_drop_mm)
+        mouth_left = pt(-mouth_half_w_mm, -mouth_drop_mm * 0.2)
+        mouth_right = pt(mouth_half_w_mm, -mouth_drop_mm * 0.2)
+        arcs.addByThreePoints(mouth_left, mouth_mid, mouth_right)
+        lines.addByTwoPoints(mouth_right, mouth_left)
+    finally:
+        try:
+            sketch.isComputeDeferred = False
+        except Exception:
+            pass
+
+    profile_infos = []
+    for i in range(sketch.profiles.count):
+        try:
+            prof = sketch.profiles.item(i)
+            props = prof.areaProperties()
+        except Exception:
+            continue
+        area_mm2 = abs(props.area) * 100.0
+        centroid = props.centroid
+        dx_mm = (centroid.x - center_2d.x) * 10.0
+        dy_mm = (centroid.y - center_2d.y) * 10.0
+        profile_infos.append({'profile': prof, 'area': area_mm2, 'dx': dx_mm, 'dy': dy_mm})
+
+    if not profile_infos:
+        return False
+
+    ring_target_area_mm2 = math.pi * (usable_r_mm ** 2 - inner_ring_r_mm ** 2)
+    eye_target_area_mm2 = math.pi * (eye_r_mm ** 2)
+    mouth_target_y_mm = -mouth_drop_mm * 0.4
+
+    used_profiles = set()
+
+    def _select_profile(score_fn):
+        best = None
+        best_score = None
+        for info in profile_infos:
+            if info['profile'] in used_profiles:
+                continue
+            score = score_fn(info)
+            if score is None:
+                continue
+            if best_score is None or score < best_score:
+                best = info
+                best_score = score
+        if best:
+            used_profiles.add(best['profile'])
+            return best['profile']
+        return None
+
+    ring_profile = _select_profile(lambda info: abs(info['area'] - ring_target_area_mm2))
+
+    left_eye_profile = _select_profile(
+        lambda info: (abs(info['dx'] + eye_offset_x_mm) + abs(info['dy'] - eye_offset_y_mm))
+        if info['area'] < eye_target_area_mm2 * 4.0 else None)
+    right_eye_profile = _select_profile(
+        lambda info: (abs(info['dx'] - eye_offset_x_mm) + abs(info['dy'] - eye_offset_y_mm))
+        if info['area'] < eye_target_area_mm2 * 4.0 else None)
+
+    mouth_profile = _select_profile(
+        lambda info: abs(info['dy'] - mouth_target_y_mm) + 0.2 * abs(info['dx']))
+
+    target_profiles = [p for p in (ring_profile, left_eye_profile, right_eye_profile, mouth_profile) if p]
+
+    if not target_profiles:
+        largest_info = max(profile_infos, key=lambda info: info['area'])
+        target_profiles = [info['profile'] for info in profile_infos if info != largest_info]
+
+    extrudes = comp.features.extrudeFeatures
+    signed_depth_mm = -abs(depth_mm) if plane.normal.z > 0 else abs(depth_mm)
+    depth_val = adsk.core.ValueInput.createByString(f"{signed_depth_mm} mm")
+
+    any_success = False
+    for prof in target_profiles:
+        profiles = adsk.core.ObjectCollection.create()
+        try:
+            profiles.add(prof)
+        except Exception:
+            continue
+        if profiles.count == 0:
+            continue
+
+        ext_input = extrudes.createInput(profiles, adsk.fusion.FeatureOperations.CutFeatureOperation)
+        ext_input.setDistanceExtent(False, depth_val)
+        ext_input.isSolid = True
+        try:
+            extrudes.add(ext_input)
+            any_success = True
+        except Exception:
+            continue
+
+    if not any_success:
+        return False
+
+    try:
+        sketch.isVisible = False
+    except Exception:
+        pass
+
+    return True
 
 def _make_band(comp: adsk.fusion.Component, outer_d_mm: float, inner_d_mm: float, make_solid: bool = False) -> adsk.fusion.BRepBody:
     base_body = _make_revolved_sphere(comp, _cm(outer_d_mm / 2.0)) if make_solid else _make_shell(comp, outer_d_mm, inner_d_mm)
@@ -658,8 +821,13 @@ def run(_context: str):
             except Exception:
                 band_thickness_mm = SLICE_HALF_THICK_MM * 2.0
 
-            # Skip pattern application for the innermost ring (keep the core solid)
+            # For the innermost ring, engrave smiley faces on both planar sides
             if index == (ring_count - 1):
+                top_face = _planar_face(band, True)
+                bottom_face = _planar_face(band, False)
+                for engr_face in (top_face, bottom_face):
+                    if engr_face:
+                        _engrave_smiley(comp, engr_face, outer_mm, depth_mm=1.0)
                 continue
 
             # For rings 1-3 (outermost three), apply center-based pyramids to remove large wedges quickly
