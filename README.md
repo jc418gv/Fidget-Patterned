@@ -1,6 +1,6 @@
 # Patterned Geometry Generator
 
-Parametric script for Autodesk Fusion 360 that generates repeatable, tessellated pattern geometries from a user-defined profile. The tool is intended for designers and engineers who need procedurally generated surface or volume patterns for visualization, prototyping, or fabrication workflows.
+Parametric script for Autodesk Fusion that generates repeatable, tessellated pattern geometries from a user-defined profile. The tool is intended for designers and engineers who need procedurally generated surface or volume patterns for visualization, prototyping, or fabrication workflows.
 
 Features
 - Procedural generation of patterned geometry from a base profile.
